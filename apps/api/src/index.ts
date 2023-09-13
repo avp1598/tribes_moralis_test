@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { EthChain, getTxnCountByAddress, getTxnsByAddress } from "sdk";
+import { getTxnCountByAddress, getTxnsByAddress } from "sdk";
 import { HTTPException } from "hono/http-exception";
 import { env } from "hono/adapter";
 
@@ -43,7 +43,6 @@ app.get("/getTransactionCount", async (c) => {
   }
 
   const res = await getTxnCountByAddress({
-    chainId: chain as any,
     walletAddress: address,
     moralisApiKey: MORALIS_API_KEY,
   });

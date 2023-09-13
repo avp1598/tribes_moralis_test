@@ -1,33 +1,54 @@
-import { formatEther } from "viem";
+import { formatEther, formatUnits } from "viem";
+import { createTransaction, fetchContracts, getPlatformLabel } from "./utils";
+import {
+  DecodedTransaction,
+  ERCContract,
+  EthTxnType,
+  GetTxnCountByAddressParams,
+  GetTxnsByAddressParams,
+  NFTContract,
+} from "./types";
 
-export const getTxnCountByAddress = async ({
-  chainId,
-  walletAddress,
-  moralisApiKey,
-}: GetTxnCountByAddressParams) => {
-  const res = await fetch(
-    `https://deep-index.moralis.io/api/v2.2/wallets/${walletAddress}/stats?chain=${chainId}`,
-    {
-      headers: {
-        "X-API-Key": moralisApiKey,
+export const getTxnCountByAddress = async (
+  params: GetTxnCountByAddressParams
+) => {
+  const { walletAddress, moralisApiKey } = params;
+  try {
+    const [ethRes, polygonRes] = await Promise.all([
+      fetch(
+        `https://deep-index.moralis.io/api/v2.2/wallets/${walletAddress}/stats?chain=eth`,
+        {
+          headers: {
+            "X-API-Key": moralisApiKey,
+          },
+        }
+      ).then((res) => res.json()),
+      fetch(
+        `https://deep-index.moralis.io/api/v2.2/wallets/${walletAddress}/stats?chain=polygon`,
+        {
+          headers: {
+            "X-API-Key": moralisApiKey,
+          },
+        }
+      ).then((res) => res.json()),
+    ]);
+
+    return {
+      eth: {
+        count: ethRes.transactions.total,
       },
-    }
-  );
-  const response = await res.json();
-  return {
-    count: response.transactions.total,
-    walletAddress,
-  };
+      polygon: {
+        count: polygonRes.transactions.total,
+      },
+    };
+  } catch (error) {
+    console.error("Error fetching data:", error);
+    throw error;
+  }
 };
 
-export const getTxnsByAddress = async ({
-  chainId,
-  walletAddress,
-  moralisApiKey,
-  cursor,
-}: GetTxnsByAddressParams) => {
-  console.log({ walletAddress, chainId });
-  const API_LIMIT = 25;
+export const getTxnsByAddress = async (params: GetTxnsByAddressParams) => {
+  const { chainId, walletAddress, moralisApiKey, cursor } = params;
   const BASE_URL = `https://deep-index.moralis.io/api/v2.2/${walletAddress}`;
   const HEADERS = {
     headers: {
@@ -37,298 +58,150 @@ export const getTxnsByAddress = async ({
 
   const allTransactionsResponse = await fetch(
     cursor
-      ? `${BASE_URL}/verbose?chain=${chainId}&limit=50&cursor=${cursor}`
-      : `${BASE_URL}/verbose?chain=${chainId}&limit=50`,
+      ? `${BASE_URL}/verbose?chain=${chainId}&cursor=${cursor}`
+      : `${BASE_URL}/verbose?chain=${chainId}`,
     HEADERS
   );
 
   const data = await allTransactionsResponse.json();
+  const nextCursor = data.cursor;
   const allTransactions: DecodedTransaction[] = data.result;
 
-  const endBlock = allTransactions[0].block_number;
-  const startBlock = allTransactions[allTransactions.length - 1].block_number;
+  const uniqueAddresses = getUniqueAddresses(chainId, allTransactions);
+
+  const { ercContracts, nftContracts } = await fetchContracts(uniqueAddresses);
 
   try {
-    const [ercTransactionsResponse, nftTransactionsResponse] =
-      await Promise.all([
-        fetch(
-          `${BASE_URL}/erc20/transfers?chain=eth&format=decimal&from_block=${startBlock}&to_block=${endBlock}&limit=${API_LIMIT}`,
-          HEADERS
-        ),
-        fetch(
-          `${BASE_URL}/nft/transfers?chain=eth&format=decimal&from_block=${startBlock}&to_block=${endBlock}&limit=${API_LIMIT}`,
-          HEADERS
-        ),
-      ]);
-
-    const erc20Data = await ercTransactionsResponse.json();
-    const nftData = await nftTransactionsResponse.json();
-
-    let ercCursor = erc20Data.cursor;
-    let nftCursor = nftData.cursor;
-
-    let ercTransactions: ERCTransaction[] = erc20Data.result || [];
-    let nftTransactions: NFTTransaction[] = nftData.result || [];
-
-    let ercStartBlock =
-      ercTransactions[ercTransactions.length - 1].block_number;
-
-    let nftStartBlock =
-      nftTransactions[nftTransactions.length - 1].block_number;
-
-    const returnObj: GetTxnsByAddressResponse = {
-      transactions: [],
-      cursor: "",
-    };
-
-    let contracts = 0;
-
-    for (const txn of allTransactions) {
-      if (
-        txn.block_number < ercStartBlock &&
-        ercTransactions.length === API_LIMIT
-      ) {
-        console.log("fetching erc20 transactions again");
-        const erc20Response = await fetch(
-            `${BASE_URL}/erc20/transfers?chain=eth&format=decimal&from_block=${startBlock}}&to_block=${endBlock}&limit=${API_LIMIT}&cursor=${ercCursor}`,
-            HEADERS
-          ),
-          erc20Data = await erc20Response.json();
-        ercStartBlock =
-          erc20Data.result[erc20Data.result.length - 1].block_number;
-        ercCursor = erc20Data.cursor;
-        ercTransactions = erc20Data.result;
-      }
-
-      if (
-        txn.block_number < nftStartBlock &&
-        nftTransactions.length === API_LIMIT
-      ) {
-        const nftResponse = await fetch(
-            `${BASE_URL}/nft/transfers?chain=eth&format=decimal&from_block=${startBlock}&to_block=${endBlock}&cursor=${nftCursor}&limit=${API_LIMIT}`,
-            HEADERS
-          ),
-          nftData = await nftResponse.json();
-        nftStartBlock = nftData.result[nftData.result.length - 1].block_number;
-        nftCursor = nftData.cursor;
-        nftTransactions = nftData.result;
-      }
-      if (txn.decoded_call?.signature.includes("transfer")) {
-        const ercTxnIndex = ercTransactions.findIndex(
-          (ercTxn) => ercTxn.transaction_hash === txn.hash
-        );
-        if (ercTxnIndex > -1) {
-          returnObj.transactions.push({
-            type: EthTxnType.transfer,
-            id: txn.hash,
-            from: txn.from_address,
-            to: txn.to_address,
-            timestamp: Date.parse(txn.block_timestamp),
-            value: ercTransactions[ercTxnIndex].value_decimal,
-            contractAddress: ercTransactions[ercTxnIndex].address,
-            tokenName: ercTransactions[ercTxnIndex].token_name,
-            transferType: "ERC20",
-            tokenId: "",
-            chainId: 1,
-          });
-          continue;
-        }
-      }
-
-      const nftTxnIndex = nftTransactions.findIndex(
-        (nftTxn) => nftTxn.transaction_hash === txn.hash
-      );
-
-      if (nftTxnIndex > -1) {
-        returnObj.transactions.push({
-          type: EthTxnType.transfer,
-          id: txn.hash,
-          from: txn.from_address,
-          to: txn.to_address,
-          timestamp: Date.parse(txn.block_timestamp),
-          value: nftTransactions[nftTxnIndex].amount,
-          contractAddress: nftTransactions[nftTxnIndex].token_address,
-          tokenName: "",
-          transferType: nftTransactions[nftTxnIndex].contract_type,
-          tokenId: nftTransactions[nftTxnIndex].token_id,
-          chainId: 1,
-        });
-        continue;
-      }
-
-      if (BigInt(txn.value) > BigInt(0) && txn.input === "0x") {
-        returnObj.transactions.push({
-          type: EthTxnType.transfer,
-          id: txn.hash,
-          from: txn.from_address,
-          to: txn.to_address,
-          timestamp: Date.parse(txn.block_timestamp),
-          value: formatEther(BigInt(txn.value)),
-          contractAddress: null,
-          tokenName: null,
-          transferType: "ETH",
-          tokenId: null,
-          chainId: 1,
-        });
-        continue;
-      }
-
-      returnObj.transactions.push({
-        type: EthTxnType.contractCall,
-        id: txn.hash,
-        signature: txn.decoded_call?.signature || "",
-        params: txn.decoded_call?.params || [],
-        from: txn.from_address,
-        to: txn.to_address,
-        timestamp: Date.parse(txn.block_timestamp),
-        value: formatEther(BigInt(txn.value)),
-      });
-      contracts++;
-    }
-    console.log({ contracts });
-
-    returnObj.cursor = data.cursor;
-    return returnObj;
+    const transactions = allTransactions.map((txn) =>
+      mapTransaction(txn, ercContracts, nftContracts)
+    );
+    console.dir(transactions);
+    return { transactions, cursor: nextCursor };
   } catch (error) {
     throw error;
   }
 };
 
-// getTxnCountByAddress({
-//   chainId: "eth",
-//   walletAddress: "0x6304CE63F2EBf8C0Cc76b60d34Cc52a84aBB6057",
-// });
+const getUniqueAddresses = (
+  chain: "eth" | "polygon",
+  transactions: DecodedTransaction[]
+) => {
+  const addressSet = new Set();
+  const uniqueAddresses = [];
 
-// getTxnsByAddress({
-//   chainId: "eth",
-//   walletAddress: "0x6304CE63F2EBf8C0Cc76b60d34Cc52a84aBB6057",
-// });
+  for (const txn of transactions) {
+    const key = `${txn.to_address}-${1}`;
+    if (!addressSet.has(key)) {
+      addressSet.add(key);
+      uniqueAddresses.push({
+        chainId: chain === "eth" ? 1 : (137 as 1 | 137),
+        address: txn.to_address,
+      });
+    }
+  }
 
-interface NFTTransaction {
-  block_number: string;
-  block_timestamp: string;
-  block_hash: string;
-  transaction_hash: string;
-  transaction_index: number;
-  log_index: number;
-  value: string;
-  contract_type: "ERC721" | "ERC1155";
-  transaction_type: string;
-  token_address: string;
-  token_id: string;
-  from_address: string;
-  from_address_label: string;
-  to_address: string;
-  to_address_label: string;
-  amount: string;
-  verified: number;
-  operator: string;
-  possible_spam: boolean;
-  verified_collection: boolean;
-}
-
-interface ERCTransaction {
-  token_name: string;
-  token_symbol: string;
-  token_logo: string;
-  token_decimals: string;
-  from_address: string;
-  from_address_label: string;
-  to_address: string;
-  to_address_label: string;
-  address: string;
-  block_hash: string;
-  block_number: string;
-  block_timestamp: string;
-  transaction_hash: string;
-  transaction_index: number;
-  log_index: number;
-  value: string;
-  possible_spam: boolean;
-  value_decimal: string;
-}
-
-interface DecodedTransaction {
-  hash: string;
-  none: string;
-  transactionIndex: string;
-  from_address: string;
-  from_address_label: string;
-  to_address: string;
-  to_address_label: string;
-  value: string;
-  gas: string;
-  gas_price: string;
-  input: string;
-  receipt_cumulative_gas_used: string;
-  receipt_gas_used: string;
-  receipt_contract_address: string;
-  receipt_root: string;
-  receipt_status: string;
-  block_timestamp: string;
-  block_number: string;
-  block_hash: string;
-  transfer_index: string[];
-  logs: any[];
-  decoded_call: {
-    signature: string;
-    label: string;
-    type: string;
-    params: any[];
-  } | null;
-}
-
-export enum EthChain {
-  ethereum = 1,
-  polygon = 137,
-}
-
-export enum EthTxnType {
-  transfer = "transfer",
-  contractCall = "contractCall",
-}
-
-type GetTxnCountByAddressParams = {
-  chainId: "eth" | "polygon";
-  walletAddress: string;
-  moralisApiKey: string;
+  return uniqueAddresses;
 };
 
-type GetTxnsByAddressParams = {
-  chainId: "eth" | "polygon";
-  walletAddress: string;
-  moralisApiKey: string;
-  cursor?: string;
-};
+const mapTransaction = (
+  txn: DecodedTransaction,
+  ercContracts: ERCContract[],
+  nftContracts: NFTContract[]
+) => {
+  const timestamp = Date.parse(txn.block_timestamp);
+  const findContract = (address: string) =>
+    ercContracts.find((contract) => contract.address === address) ||
+    nftContracts.find((contract) => contract.address === address);
+  const findParamValue = (name: string) =>
+    txn.decoded_call?.params.find((param) => param.name.includes(name))?.value;
+  const formatValue = (value: string, decimals = 18) =>
+    formatUnits(BigInt(value), decimals);
 
-type EthContractCallTxn = {
-  type: EthTxnType.contractCall;
-  id: string;
-  signature: string; // method signature
-  params: any[];
-  from: string;
-  to: string;
-  timestamp: number;
-  value: string;
-};
+  if (BigInt(txn.value) > BigInt(0) && txn.input === "0x") {
+    return createTransaction(txn, timestamp, EthTxnType.transfer, {
+      amount: formatEther(BigInt(txn.value)),
+      transferType: "ETH",
+    });
+  }
 
-type EthTransferTxn = {
-  type: EthTxnType.transfer;
-  id: string;
-  from: string;
-  to: string;
-  timestamp: number;
-  value: string;
-  contractAddress: string | null; // null for ETH and non-null for ERC20, ERC721, etc.
-  tokenName: string | null; // null for ETH and non-null for ERC20, ERC721, etc.
-  transferType: "ERC20" | "ERC721" | "ERC1155" | "ETH";
-  tokenId: string | null; // null for ETH and non-null for ERC20, ERC721, etc.
-  chainId: EthChain;
-};
+  if (!txn.decoded_call) {
+    return createTransaction(txn, timestamp, EthTxnType.raw, {
+      value: formatEther(BigInt(txn.value)),
+      input: txn.input,
+    });
+  }
 
-type EThTransaction = EthTransferTxn | EthContractCallTxn;
+  const contract = findContract(txn.to_address);
+  const value = findParamValue("value") ?? txn.value;
 
-type GetTxnsByAddressResponse = {
-  transactions: EThTransaction[];
-  cursor: string;
+  if (txn.decoded_call.signature.includes("transfer")) {
+    return createTransaction(txn, timestamp, EthTxnType.transfer, {
+      amount: formatValue(value, (contract as ERCContract)?.decimals),
+      contractAddress: txn.to_address,
+      tokenName: contract?.symbol ?? "",
+      transferType:
+        (contract as NFTContract)?.contractType === 721
+          ? "ERC721"
+          : (contract as NFTContract)?.contractType === 1155
+          ? "ERC1155"
+          : "ERC20",
+    });
+  }
+
+  if (
+    txn.decoded_call.signature.toLowerCase().includes("mint") ||
+    txn.decoded_call.signature.toLowerCase().includes("purchase")
+  ) {
+    const tokenIds = txn.logs
+      .filter((log) => log.decoded_event?.signature.includes("Transfer"))
+      .map(
+        (log) =>
+          log.decoded_event.params?.find((param: any) =>
+            param.name.includes("value")
+          )?.value
+      );
+
+    return createTransaction(txn, timestamp, EthTxnType.mint, {
+      amount: tokenIds.length.toString(),
+      contractAddress: txn.to_address,
+      collectionName: contract?.name ?? "",
+      tokenType:
+        (contract as NFTContract)?.contractType === 721 ? "ERC721" : "ERC1155",
+      tokenId: tokenIds.join(","),
+    });
+  }
+
+  if (txn.decoded_call.signature.includes("approve")) {
+    return createTransaction(txn, timestamp, EthTxnType.approve, {
+      amount: formatValue(value, (contract as ERCContract)?.decimals),
+      contractAddress: txn.to_address,
+      tokenName: contract?.symbol ?? "",
+    });
+  }
+
+  if (txn.decoded_call.signature.toLowerCase().includes("swap")) {
+    return createTransaction(txn, timestamp, EthTxnType.swap, {
+      contractAddress: txn.to_address,
+      platform: getPlatformLabel(txn.to_address_label),
+    });
+  }
+
+  if (
+    txn.decoded_call.signature.toLowerCase().includes("sendToL2") ||
+    txn.decoded_call.signature.toLowerCase().includes("bridge")
+  ) {
+    const chainId = findParamValue("chainId");
+    return createTransaction(txn, timestamp, EthTxnType.bridge, {
+      amount: formatEther(BigInt(value)),
+      contractAddress: txn.to_address,
+      platform: getPlatformLabel(txn.to_address_label),
+      chainId,
+    });
+  }
+
+  return createTransaction(txn, timestamp, EthTxnType.contractCall, {
+    signature: txn.decoded_call.signature,
+    params: txn.decoded_call.params,
+    value: formatEther(BigInt(txn.value)),
+  });
 };
